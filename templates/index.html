@@ -1,0 +1,320 @@
+<!-- templates/index.html -->
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>데모: 시간 동기화 기반 행렬 키 교환 & 회전</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; }
+    button { margin: 5px; padding: 8px 12px; }
+    #status { white-space: pre-wrap; background: #f0f0f0; padding: 10px; margin-top: 10px; }
+    input, textarea { margin: 5px 0; width: 100%; }
+    textarea { height: 80px; }
+  </style>
+</head>
+<body>
+
+  <h2>시간 동기화 기반 행렬 키 교환 데모</h2>
+
+  <!-- 1) 시간 동기화 -->
+  <div>
+    <button id="btnSync">1. Sync Time (클라이언트→서버)</button><br/>
+    TK 값: <span id="tkDisplay">-</span><br/>
+  </div>
+
+  <!-- 2) 행렬 교환 (M_A → M_B) -->
+  <div>
+    <button id="btnMatrix">2. Send Matrix &amp; Receive M_B_masked</button><br/>
+    <span id="matrixStatus">-</span><br/>
+  </div>
+
+  <!-- 3) 키 회전 (원할 때마다 다시 행렬 교환) -->
+  <div>
+    <button id="btnRotate">3. Rotate Keys (다시 행렬 교환)</button><br/>
+    <span id="rotateStatus">-</span><br/>
+  </div>
+
+  <!-- 4) 메시지 암호화/복호화 -->
+  <div>
+    <label for="plaintext">4. Plaintext 입력:</label><br/>
+    <textarea id="plaintext">HELLO WORLD!</textarea><br/>
+    <button id="btnEncrypt">Encrypt &amp; Send to Server</button><br/>
+    복호화된 서버 응답: <span id="decryptedText">-</span><br/>
+  </div>
+
+  <!-- 상태 출력 영역 -->
+  <div id="status"></div>
+
+
+  <script>
+    // --------------------------------------------------
+    // 전역 변수 (클라이언트 측)
+    // --------------------------------------------------
+    let TK_client = null;                // 클라이언트가 계산한 정수형 TK
+    let M_A_client = null;               // 클라이언트가 만든 자신의 행렬 M_A
+    let M_B_client = null;               // 서버가 보낸 M_B_masked 로부터 복원된 M_B
+    let Key_client = null;               // 클라이언트가 자체 계산한 공유 키 행렬
+    const n = 4;         // 행렬 차원 (app.py와 동일해야 함)
+
+    const statusDiv = document.getElementById('status');
+    const tkDisplay = document.getElementById('tkDisplay');
+    const matrixStatus = document.getElementById('matrixStatus');
+    const rotateStatus = document.getElementById('rotateStatus');
+    const decryptedText = document.getElementById('decryptedText');
+
+    // 로그 출력 헬퍼
+    function log(msg) {
+      statusDiv.textContent += msg + "\n";
+    }
+    function clearLog() {
+      statusDiv.textContent = "";
+    }
+
+    // --------------------------------------------------
+    // 1) 시간 동기화 함수
+    // --------------------------------------------------
+    document.getElementById('btnSync').addEventListener('click', async () => {
+      clearLog();
+      log("→ [클라이언트] 시간 동기화 시작");
+      const t1 = Date.now() / 1000.0; // 초 단위로 기록 (밀리초 → 초)
+      // 서버에 t1 전송
+      const resp1 = await fetch('/time_sync', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({t1: t1})
+      });
+      const data = await resp1.json();
+      const t2 = data.t2; 
+      const t1_returned = data.t1;
+      const t3 = Date.now() / 1000.0;
+      // RTT 계산
+      const rtt = t3 - t1_returned;
+      log(`← [클라이언트] 받은 t2(Server): ${t2.toFixed(4)}\n`);
+      log(`RTT = t3 - t1 = ${rtt.toFixed(4)}초`);
+
+      // SHA-256(RTT) → TK_int (정수)
+      const hashBuffer = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(rtt.toString())
+      );
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const hashHex = hashArray.map(b => b.toString(16).padStart(2,'0')).join('');
+      // 16진수 → 10진수 정수
+      TK_client = BigInt('0x' + hashHex);
+      tkDisplay.textContent = TK_client.toString();
+      log(`→ [클라이언트] TK (SHA-256) 계산: ${TK_client.toString().slice(0,20)}... (총길이 ${hashHex.length} hex)`);
+
+      // 서버에도 TK 송신
+      await fetch('/set_tk', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({tk: TK_client.toString()})
+      });
+      log("→ [클라이언트] TK를 서버에 전송 완료.");
+    });
+
+
+    // --------------------------------------------------
+    // 2) 행렬 교환 함수
+    //    (클라이언트: M_A 생성 → M_A_masked → 서버로 전송 → 서버가 M_B_masked 반환 → M_B 복원 → Key 계산)
+    // --------------------------------------------------
+    document.getElementById('btnMatrix').addEventListener('click', async () => {
+      if (TK_client === null) {
+        alert("먼저 1) 시간 동기화를 수행하여 TK를 생성하세요.");
+        return;
+      }
+      clearLog();
+      log("→ [클라이언트] 행렬 교환 시작");
+      // 1) 클라이언트: 무작위 가역 행렬 M_A 생성
+      M_A_client = randomInvertibleMatrix(n);
+      log(`  • [클라이언트] M_A 생성:\n    ${matrixToString(M_A_client)}`);
+
+      // 2) M_A_masked = M_A + TK_client
+      //    (BigInt이므로, 각 요소를 BigInt로 바꿔 더함 → 다시 Number로.)
+      const M_A_masked = [];
+      for (let i = 0; i < n; i++) {
+        M_A_masked.push([]);
+        for (let j = 0; j < n; j++) {
+          // BigInt + Number → BigInt → Number (JS 안전 범위 내)
+          const masked = Number(BigInt(M_A_client[i][j]) + TK_client);
+          M_A_masked[i].push(masked);
+        }
+      }
+      log(`  • [클라이언트] M_A_masked 계산 (M_A + TK):\n    ${matrixToString(M_A_masked)}`);
+
+      // 3) 서버에 M_A_masked 전송
+      const resp2 = await fetch('/send_matrix', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({M_A_masked: M_A_masked})
+      });
+      const data2 = await resp2.json();
+      if (data2.error) {
+        alert("서버 에러: " + data2.error);
+        return;
+      }
+      // 4) 서버가 보낸 M_B_masked를 받아서 M_B_client 계산
+      const M_B_masked = data2.M_B_masked;
+      log(`← [클라이언트] 받은 M_B_masked:\n    ${matrixToString(M_B_masked)}`);
+
+      // M_B = M_B_masked - TK_client
+      M_B_client = [];
+      for (let i = 0; i < n; i++) {
+        M_B_client.push([]);
+        for (let j = 0; j < n; j++) {
+          const recovered = Number(BigInt(M_B_masked[i][j]) - TK_client);
+          M_B_client[i].push(recovered);
+        }
+      }
+      log(`  • [클라이언트] 복원된 M_B:\n    ${matrixToString(M_B_client)}`);
+
+      // 5) 공유 키(Key_client) = M_A_client @ M_B_client
+      Key_client = multiplyMatrix(M_A_client, M_B_client);
+      log(`  • [클라이언트] Key_client (M_A @ M_B):\n    ${matrixToString(Key_client)}`);
+
+      matrixStatus.textContent = "행렬 교환 완료 → 공유 키 생성됨";
+    });
+
+
+    // --------------------------------------------------
+    // 3) Rotate Keys 버튼 (다시 행렬 교환)
+    //    → 실제로는 위 btnMatrix와 동일 로직을 재호출
+    // --------------------------------------------------
+    document.getElementById('btnRotate').addEventListener('click', async () => {
+      if (TK_client === null) {
+        alert("먼저 1) 시간 동기화를 수행하여 TK를 생성하세요.");
+        return;
+      }
+      // 동일한 함수 호출
+      await document.getElementById('btnMatrix').click();
+      rotateStatus.textContent = "키 회전(행렬 교환) 완료";
+    });
+
+
+    // --------------------------------------------------
+    // 4) 메시지 암호화 & 서버 복호화 요청
+    // --------------------------------------------------
+    document.getElementById('btnEncrypt').addEventListener('click', async () => {
+      if (Key_client === null) {
+        alert("먼저 2) 행렬 교환을 완료하여 Key_client를 생성하세요.");
+        return;
+      }
+      clearLog();
+      const plaintext = document.getElementById('plaintext').value;
+      log(`→ [클라이언트] 평문: "${plaintext}"`);
+
+      // 1) 텍스트를 ASCII 코드 벡터로 바꾸고, 블록 크기(n)만큼 쪼갠 뒤 패딩(공백: 32 사용)
+      const blocks = [];
+      let idx = 0;
+      while (idx < plaintext.length) {
+        const chunk = plaintext.slice(idx, idx + n);
+        const padded = chunk.padEnd(n, ' '); // 공백으로 패딩
+        const vec = [];
+        for (let c of padded) {
+          vec.push(c.charCodeAt(0)); // ASCII 코드
+        }
+        blocks.push(vec);
+        idx += n;
+      }
+      log(`  • [클라이언트] 블록 (${n}개씩) 생성 & 패딩 → numeric vectors:`);
+      blocks.forEach(b => log(`    [${b.join(', ')}]`));
+
+      // 2) 암호화: Key_client @ P
+      const cipherBlocks = [];
+      for (let b of blocks) {
+        const C = multiplyMatrix(Key_client, [b]); 
+        // multiplyMatrix expects 2D arrays; [b]를 (1×n) 배열로 곱해서 (n×1) 결과를 얻음
+        // multiplyMatrix 결과는 2D 배열이므로, 첫 번째 컬럼(각 행)을 추출
+        const Ccol = C.map(row => row[0]);
+        cipherBlocks.push(Ccol);
+      }
+      log(`  • [클라이언트] 암호문 (각 블록마다 ${n}개 숫자):`);
+      cipherBlocks.forEach(cb => log(`    [${cb.join(', ')}]`));
+
+      // 3) 서버로 암호문 전송 → 서버에서 복호화 후 평문 반환
+      const resp = await fetch('/decrypt', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({cipher: cipherBlocks})
+      });
+      const data = await resp.json();
+      const recov = data.plaintext || "[Error]";
+      log(`← [서버] 복호화 결과: "${recov}"`);
+      decryptedText.textContent = recov;
+    });
+
+
+
+    // --------------------------------------------------
+    // 헬퍼: JS에서 무작위 가역 행렬 생성 (클라이언트 측)
+    //    → 간단히 determinant가 0이 아닐 때까지 반복 생성
+    // --------------------------------------------------
+    function randomInvertibleMatrix(n) {
+      while (true) {
+        const M = [];
+        for (let i = 0; i < n; i++) {
+          M.push([]);
+          for (let j = 0; j < n; j++) {
+            M[i].push(Math.floor(Math.random() * 9) + 1); // 1~9 범위
+          }
+        }
+        // 판별식 계산 (정수 행렬에 한해 근사적으로)
+        const det = determinant(M);
+        if (Math.round(det) !== 0) {
+          return M;
+        }
+      }
+    }
+
+    // --------------------------------------------------
+    // 헬퍼: 두 행렬 곱셈 (일반적인 2D 배열 곱)
+    //   A: m×n, B: n×p → 결과: m×p
+    // --------------------------------------------------
+    function multiplyMatrix(A, B) {
+      const m = A.length, nA = A[0].length;
+      const nB = B.length, p = B[0].length;
+      if (nA !== nB) {
+        console.error("Matrix dimension mismatch.");
+        return null;
+      }
+      const C = Array.from({length: m}, () => Array(p).fill(0));
+      for (let i = 0; i < m; i++) {
+        for (let j = 0; j < p; j++) {
+          let sum = 0;
+          for (let k = 0; k < nA; k++) {
+            sum += A[i][k] * B[k][j];
+          }
+          C[i][j] = sum;
+        }
+      }
+      return C;
+    }
+
+    // --------------------------------------------------
+    // 헬퍼: 단순 행렬 판별식 계산 (소규모 n=4 정도에서는 충분)
+    //   n×n 행렬 M (2차원 배열) → determinant (float) 반환
+    //   구현: 재귀적 랩플레이스(이 중 상세 구현은 생략 가능하나, 데모용으로 추가)
+    // --------------------------------------------------
+    function determinant(M) {
+      const n = M.length;
+      if (n === 1) return M[0][0];
+      if (n === 2) return M[0][0]*M[1][1] - M[0][1]*M[1][0];
+      let det = 0;
+      for (let col = 0; col < n; col++) {
+        // 소행렬 minor
+        const sub = M.slice(1).map(row => row.filter((_, j) => j !== col));
+        det += ((col % 2 === 0 ? 1 : -1) * M[0][col] * determinant(sub));
+      }
+      return det;
+    }
+
+    // --------------------------------------------------
+    // 헬퍼: 행렬 2D 배열을 문자열로 예쁘게 출력
+    // --------------------------------------------------
+    function matrixToString(M) {
+      return M.map(row => "[" + row.join(", ") + "]").join("\n    ");
+    }
+  </script>
+</body>
+</html>
